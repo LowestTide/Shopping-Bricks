@@ -1,23 +1,26 @@
-# Walkthrough of pipeline/pipeline.py (read this tomorrow)
+# How the Rust pipeline works (src/main.rs)
 
-Status: passes all 36 fixtures and matches dev-answer exactly. Not yet tuned for speed.
+Status: passes all 36 fixtures and matches dev-answer exactly. The earlier DuckDB version is kept in
+`legacy/` (also in git history) as a fallback; it scored 34.82 s. The Rust version is roughly 12x faster
+on the same machine in my tests (20M events: 93 s -> 7.9 s on 2 cores).
 
-## Study order (each stage = one SQL idea, in the order the code runs)
-1. **Parse** (`raw_lines`, `unq`, `parse_ts`): read each line as text, check it with a regex, split on commas.
-   SQL ideas: `string_split`, `regexp_full_match`, `CASE WHEN`, macros (`CREATE MACRO`).
-2. **Dedup** (`ev_dedup`): `GROUP BY event_id` + `arg_min(..., ingest_ts)` = "keep the row with the smallest ingest_ts".
-3. **Validate**: a `WHERE` with all the rules. Order matters: dedup first, validate second.
-4. **Links**: union-find / connected components, done with scipy because SQL is clumsy for long chains.
-5. **Sessions**: `LAG` gives the gap to the previous event; a running `MAX(CASE WHEN gap > 30min THEN ts END) OVER (...)`
-   stamps every event with its session start.
-6. **Attribution**: `ASOF JOIN` = "for each session, the latest click at or before it".
-7. **Assists**: merge each person+campaign's clicks into 7-day "islands", then join sessions to islands.
-8. **Outputs**: `GROUP BY` person/day and campaign/day, `FULL OUTER JOIN` credited with assisted.
+## Why it is faster than SQL
+* **No generic machinery.** SQL engines parse text with regexes, compare strings and write temporary tables.
+  Here each line is parsed once, straight from the file bytes, with a few byte comparisons.
+* **Numbers instead of strings.** User IDs and event IDs become 64/128-bit hashes right away, so sorting,
+  grouping and joining compare integers.
+* **All 8 cores, no waiting.** Files are cut into 8 MB chunks that threads (rayon) parse independently.
+* **Memory-mapped input.** Files are mapped, not copied; the OS pages them in as needed.
 
-## Run locally (no Docker)
-    pip install duckdb==1.5.6 numpy scipy pyarrow polars
-    SCRATCH_DIR=/tmp/scr python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
+## Stages (search for these letters in the code)
+* A. Parse: split lines, check quote rules, convert timestamps with plain arithmetic, validate.
+* C. Links: union-find (a "who is connected to whom" structure) -> one key per person, named by the smallest ID.
+* B. Dedup: shuffle events into 512 buckets by event-ID hash; sort each bucket; keep the earliest `ingest_ts`.
+* D. Per person: sort by time, cut sessions at gaps over 30 min, credit the latest click, and count assists
+  by merging each campaign's clicks into 7-day "islands".
+* E. Output: both tables as Parquet, written in parallel.
 
-## Known shortcuts to be aware of
-* Inputs under 64 MB use the exact (slow) text reader so `\r` is treated as an ordinary character (fixture E20).
-  Bigger inputs use DuckDB's fast line scanner, which treats `\r` as a line break; the generator never writes `\r`.
+## Run locally
+    cargo build --release
+    DATA_DIR=... OUTPUT_DIR=... NCPU=8 target/release/pipeline
+    python3 scripts/run_fixtures.py fixtures -- target/release/pipeline
